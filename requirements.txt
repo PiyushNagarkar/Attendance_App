@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+python-jose[cryptography]
+passlib
+pydantic-settings
+qrcode[pil]
+reportlab
+psycopg[binary]
