@@ -4,6 +4,7 @@ sqlalchemy
 python-jose[cryptography]
 passlib
 pydantic-settings
+python-dotenv
 qrcode[pil]
 reportlab
 psycopg[binary]
