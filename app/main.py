@@ -15,6 +15,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, create_engine, or_, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy.pool import NullPool
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./attendance.db")
@@ -155,6 +156,23 @@ with engine.connect() as conn:
             conn.commit()
         except Exception:
             pass
+
+# Automatic initial admin & demo seed on fresh deployment
+try:
+    with SessionLocal() as s:
+        admin_acc = s.query(User).filter_by(email="admin@attendance.app").first()
+        if not admin_acc:
+            admin_acc = User(
+                name="Campus Administrator",
+                email="admin@attendance.app",
+                password_hash=pwd.hash("Admin@12345"),
+                role=Role.ADMIN.value,
+                active=True,
+            )
+            s.add(admin_acc)
+            s.commit()
+except Exception:
+    pass
 
 def log_audit(s: Session, action: str, target_type: str, details: str, user_id: Optional[int] = None, target_id: Optional[int] = None):
     try:
