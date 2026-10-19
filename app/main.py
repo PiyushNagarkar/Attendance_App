@@ -345,7 +345,7 @@ def is_inside_polygon(px, py, poly_xy):
         p1x, p1y = p2x, p2y
     return inside
 
-def verify_4corner_geofence(student_lat, student_lon, corners, buffer_m=5.0):
+def verify_4corner_geofence(student_lat, student_lon, corners, buffer_m=5.0, gps_accuracy_m=0.0):
     if not corners or len(corners) < 4:
         return False, 999.0
 
@@ -376,10 +376,16 @@ def verify_4corner_geofence(student_lat, student_lon, corners, buffer_m=5.0):
         if d < min_dist:
             min_dist = d
 
-    if min_dist <= buffer_m:
+    # Indoor GPS multipath uncertainty compensation (up to 8m allowance)
+    # The actual physical position is within a circle of radius gps_accuracy_m
+    gps_allowance = min(max(0.0, gps_accuracy_m) * 0.45, 8.0) if gps_accuracy_m > 0 else 0.0
+    effective_tolerance = buffer_m + gps_allowance
+
+    if min_dist <= effective_tolerance:
         return True, min_dist
 
     return False, min_dist
+
 
 def qr_payload(row):
     image = qrcode.make(row.token)
@@ -1048,30 +1054,33 @@ def checkin(data: CheckIn, s: Session = Depends(db), student: User = Depends(req
 
         if len(corners) >= 4:
             is_valid, dist_to_boundary = verify_4corner_geofence(
-                data.latitude, data.longitude, corners, buffer_m=buffer_allowed
+                data.latitude, data.longitude, corners, buffer_m=buffer_allowed, gps_accuracy_m=data.gps_accuracy_m
             )
             if not is_valid:
                 raise HTTPException(
                     403,
-                    f"Outside classroom boundary ({dist_to_boundary:.1f}m outside nearest wall; allowed buffer is {buffer_allowed:.0f}m)"
+                    f"Outside classroom boundary ({dist_to_boundary:.1f}m outside nearest wall; allowed buffer is {buffer_allowed:.0f}m, satellite precision ±{data.gps_accuracy_m:.1f}m)"
                 )
         else:
             metres = distance(data.latitude, data.longitude, room.latitude, room.longitude)
-            if metres > buffer_allowed:
+            eff_buf = buffer_allowed + min(max(0.0, data.gps_accuracy_m) * 0.45, 8.0)
+            if metres > eff_buf:
                 raise HTTPException(403, f"Outside classroom boundary ({metres:.1f}m away; allowed buffer is {buffer_allowed:.0f}m)")
             dist_to_boundary = metres
     else:
         metres = distance(data.latitude, data.longitude, room.latitude, room.longitude)
-        if metres > buffer_allowed:
+        eff_buf = buffer_allowed + min(max(0.0, data.gps_accuracy_m) * 0.45, 8.0)
+        if metres > eff_buf:
             raise HTTPException(403, f"Outside classroom boundary ({metres:.1f}m away; allowed buffer is {buffer_allowed:.0f}m)")
         dist_to_boundary = metres
 
-    if data.gps_accuracy_m > 45.0:
-        raise HTTPException(422, f"GPS accuracy is too low (±{data.gps_accuracy_m:.1f}m). Please move closer to a window and retry.")
+    if data.gps_accuracy_m > 65.0:
+        raise HTTPException(422, f"GPS satellite accuracy is too low (±{data.gps_accuracy_m:.1f}m). Please move near a window or hold phone steady and retry.")
     
     s.add(Attendance(session_id=row.id, student_id=student.id, marked_at=datetime.utcnow(), distance_m=dist_to_boundary, gps_accuracy_m=data.gps_accuracy_m, status="present"))
     s.commit()
-    return {"status": "present", "distance_m": round(dist_to_boundary, 2), "message": f"✓ Verified inside classroom boundary ({buffer_allowed:.0f}m buffer)!"}
+    return {"status": "present", "distance_m": round(dist_to_boundary, 2), "message": f"✓ Verified inside classroom boundary ({buffer_allowed:.0f}m buffer, ±{data.gps_accuracy_m:.1f}m GPS lock)!"}
+
 
 @app.get("/student/dashboard")
 def student_dashboard(s: Session = Depends(db), student: User = Depends(require(Role.STUDENT))):

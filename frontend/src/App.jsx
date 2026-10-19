@@ -134,6 +134,78 @@ function Icon({ name, size = 18, className = '' }) {
   )
 }
 
+// High-Precision Multi-Sample GPS Acquisition
+function acquireHighPrecisionGPS({ onProgress, onSuccess, onError, timeoutMs = 4500, targetAccuracy = 7.0 }) {
+  if (!navigator.geolocation) {
+    return onError(new Error('Geolocation is not supported by your browser.'))
+  }
+
+  let bestPosition = null
+  let watchId = null
+  let timeoutId = null
+  let sampleCount = 0
+
+  const finish = () => {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId)
+      watchId = null
+    }
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId)
+      timeoutId = null
+    }
+
+    if (bestPosition) {
+      onSuccess(bestPosition)
+    } else {
+      onError(new Error('Could not acquire GPS satellite signal. Ensure Location Services are ON with High Accuracy.'))
+    }
+  }
+
+  timeoutId = setTimeout(finish, timeoutMs)
+
+  try {
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        sampleCount++
+        const acc = pos.coords.accuracy
+
+        if (onProgress) {
+          onProgress({
+            accuracy: acc,
+            latitude: pos.coords.latitude,
+            longitude: pos.coords.longitude,
+            sampleCount,
+          })
+        }
+
+        if (!bestPosition || acc < bestPosition.coords.accuracy) {
+          bestPosition = pos
+        }
+
+        // If high precision is acquired (e.g. <= targetAccuracy), finish early
+        if (acc <= targetAccuracy) {
+          finish()
+        }
+      },
+      (err) => {
+        if (!bestPosition) {
+          if (watchId !== null) navigator.geolocation.clearWatch(watchId)
+          if (timeoutId !== null) clearTimeout(timeoutId)
+          onError(err)
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 0, // CRITICAL: Never reuse stale cached coordinates
+        timeout: timeoutMs,
+      }
+    )
+  } catch (err) {
+    finish()
+  }
+}
+
 function App() {
   const [token, setToken] = useState(localStorage.getItem('attendance_token') || '')
   const [role, setRole] = useState(localStorage.getItem('attendance_role') || '')
@@ -141,6 +213,9 @@ function App() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [notice, setNotice] = useState({ text: '', type: 'info' })
+  const [gpsStatus, setGpsStatus] = useState(null)
+  const [gpsLocking, setGpsLocking] = useState(false)
+
 
   // Teacher state
   const [courses, setCourses] = useState([])
@@ -314,29 +389,54 @@ function App() {
 
   const checkIn = () => {
     if (!qrToken) return showNotice('Please scan the live classroom QR first.', 'warning')
-    showNotice('Validating classroom GPS Geofence & satellites...', 'info')
-    navigator.geolocation.getCurrentPosition(
-      async ({ coords }) => {
+    setGpsLocking(true)
+    setGpsStatus({ status: 'locking', accuracy: null, message: '🛰️ Connecting to GPS satellites...' })
+    showNotice('🛰️ Acquiring multi-sample GPS satellite lock... Hold your phone steady for 3s.', 'info')
+
+    acquireHighPrecisionGPS({
+      timeoutMs: 4500,
+      targetAccuracy: 8.0,
+      onProgress: (info) => {
+        setGpsStatus({
+          status: 'locking',
+          accuracy: info.accuracy,
+          message: `Sampling GPS satellite fix (${info.sampleCount}): ±${info.accuracy.toFixed(1)}m precision`,
+        })
+      },
+      onSuccess: async (bestPos) => {
+        const { latitude, longitude, accuracy } = bestPos.coords
+        setGpsStatus({
+          status: 'locked',
+          accuracy,
+          message: `✓ High-precision satellite lock acquired (±${accuracy.toFixed(1)}m)! Validating boundary...`,
+        })
         try {
           const x = await request('/student/check-in', {
             method: 'POST',
             body: JSON.stringify({
               token: qrToken,
-              latitude: coords.latitude,
-              longitude: coords.longitude,
-              gps_accuracy_m: coords.accuracy,
+              latitude,
+              longitude,
+              gps_accuracy_m: accuracy,
             }),
           })
           showNotice(x.message, 'success')
           setQrToken('')
+          setGpsStatus(null)
+          setGpsLocking(false)
           await loadStudent()
         } catch (e) {
           showNotice(e.message, 'error')
+          setGpsStatus({ status: 'error', accuracy, message: e.message })
+          setGpsLocking(false)
         }
       },
-      (err) => showNotice(`Location Error: ${err.message}. Please enable High Accuracy Location access.`, 'error'),
-      { enableHighAccuracy: true, timeout: 15000 }
-    )
+      onError: (err) => {
+        setGpsLocking(false)
+        setGpsStatus(null)
+        showNotice(`Location Error: ${err.message}. Please enable High Accuracy Location access.`, 'error')
+      },
+    })
   }
 
   const startScanner = async () => {
@@ -554,7 +654,10 @@ function App() {
             qrToken={qrToken}
             setQrToken={setQrToken}
             checkIn={checkIn}
+            gpsStatus={gpsStatus}
+            gpsLocking={gpsLocking}
           />
+
         )}
       </main>
 
@@ -733,34 +836,42 @@ function CollegeAdminPortal({ request, showNotice }) {
     }
   }
 
-  // 4-Corner Geolocation capture handler
+  // 4-Corner Geolocation capture handler with multi-sample satellite lock
   const handleCaptureCorner = (index) => {
     setActiveCornerIndex(index)
-    showNotice(`Stand at Corner ${index + 1} and hold your phone still... Capturing GPS...`, 'info')
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
+    showNotice(`Stand at Corner ${index + 1}... Locking GPS satellites (3-4s)...`, 'info')
+
+    acquireHighPrecisionGPS({
+      timeoutMs: 4500,
+      targetAccuracy: 6.0,
+      onProgress: (info) => {
+        showNotice(`Corner ${index + 1}: Sampling fix #${info.sampleCount} (Accuracy: ±${info.accuracy.toFixed(1)}m)...`, 'info')
+      },
+      onSuccess: (pos) => {
+        const acc = pos.coords.accuracy
         setRoomForm((prev) => {
           const updated = [...prev.corners]
           updated[index] = {
             ...updated[index],
             lat: String(pos.coords.latitude),
             lng: String(pos.coords.longitude),
+            accuracy: acc.toFixed(1),
           }
           return { ...prev, corners: updated }
         })
         setActiveCornerIndex(null)
         showNotice(
-          `✓ Corner ${index + 1} Captured: ${pos.coords.latitude.toFixed(6)}, ${pos.coords.longitude.toFixed(6)} (±${pos.coords.accuracy.toFixed(1)}m)`,
+          `✓ Corner ${index + 1} Locked: ${pos.coords.latitude.toFixed(6)}, ${pos.coords.longitude.toFixed(6)} (±${acc.toFixed(1)}m precision)`,
           'success'
         )
       },
-      (err) => {
+      onError: (err) => {
         setActiveCornerIndex(null)
         showNotice(`GPS Capture Error: ${err.message}`, 'error')
       },
-      { enableHighAccuracy: true, timeout: 15000 }
-    )
+    })
   }
+
 
   // Create Classroom with 4 Corners & 5m Buffer
   const handleCreateClassroom = async (e) => {
@@ -1278,7 +1389,10 @@ function CollegeAdminPortal({ request, showNotice }) {
                         <span className="corner-num-badge">Corner {idx + 1}</span>
                         <span className="corner-label-text">{corner.label}</span>
                         {corner.lat && corner.lng ? (
-                          <span className="status-tag status-present">✓ Captured</span>
+                          <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                            <span className="status-tag status-present">✓ Locked</span>
+                            {corner.accuracy && <span className="accuracy-pill-tag">±{corner.accuracy}m</span>}
+                          </div>
                         ) : (
                           <span className="status-tag status-late">Pending</span>
                         )}
@@ -1318,10 +1432,10 @@ function CollegeAdminPortal({ request, showNotice }) {
                           className="btn btn-secondary btn-sm"
                           onClick={() => handleCaptureCorner(idx)}
                           disabled={activeCornerIndex !== null}
-                          title={`Walk to Corner ${idx + 1} and tap to record GPS`}
+                          title={`Walk to Corner ${idx + 1} and tap to record GPS with 3s satellite lock`}
                         >
                           <Icon name="location" size={12} />
-                          {activeCornerIndex === idx ? 'Recording...' : 'Capture'}
+                          {activeCornerIndex === idx ? 'Locking...' : 'Capture'}
                         </button>
                       </div>
                     </div>
@@ -1333,32 +1447,40 @@ function CollegeAdminPortal({ request, showNotice }) {
                     Perimeter Wall Buffer: <strong>{roomForm.buffer_m} meters</strong>
                   </label>
                   <div className="hint-text" style={{ marginBottom: '6px' }}>
-                    Tolerance margin outside the 4 walls to prevent false rejections from natural indoor satellite drift
+                    Tolerance margin outside the 4 walls to absorb natural indoor multi-path satellite drift
                   </div>
                   <div className="radius-presets">
-                    <button
-                      type="button"
-                      className={`preset-btn ${roomForm.buffer_m === '3' ? 'active' : ''}`}
-                      onClick={() => setRoomForm({ ...roomForm, buffer_m: '3' })}
-                    >
-                      Strict (3m)
-                    </button>
                     <button
                       type="button"
                       className={`preset-btn ${roomForm.buffer_m === '5' ? 'active' : ''}`}
                       onClick={() => setRoomForm({ ...roomForm, buffer_m: '5' })}
                     >
-                      Standard (5m)
+                      5m (Standard)
                     </button>
                     <button
                       type="button"
                       className={`preset-btn ${roomForm.buffer_m === '8' ? 'active' : ''}`}
                       onClick={() => setRoomForm({ ...roomForm, buffer_m: '8' })}
                     >
-                      Relaxed (8m)
+                      8m (Indoor Recommended)
+                    </button>
+                    <button
+                      type="button"
+                      className={`preset-btn ${roomForm.buffer_m === '12' ? 'active' : ''}`}
+                      onClick={() => setRoomForm({ ...roomForm, buffer_m: '12' })}
+                    >
+                      12m (Concrete Hall)
+                    </button>
+                    <button
+                      type="button"
+                      className={`preset-btn ${roomForm.buffer_m === '15' ? 'active' : ''}`}
+                      onClick={() => setRoomForm({ ...roomForm, buffer_m: '15' })}
+                    >
+                      15m (Deep Interior)
                     </button>
                   </div>
                 </div>
+
               </div>
 
               <button type="submit" className="btn btn-primary btn-block">
@@ -1970,10 +2092,35 @@ function CollegeStudentPortal(p) {
             />
           </div>
 
-          <button className="btn btn-primary btn-lg" onClick={p.checkIn} disabled={!p.qrToken}>
-            <Icon name="location" size={18} /> Verify Location & Check In
+          <button className="btn btn-primary btn-lg" onClick={p.checkIn} disabled={!p.qrToken || p.gpsLocking}>
+            <Icon name="location" size={18} /> {p.gpsLocking ? 'Locking Satellites...' : 'Verify Location & Check In'}
           </button>
         </div>
+
+        {/* Real-time Satellite GPS Accuracy Monitor */}
+        {p.gpsStatus ? (
+          <div className={`gps-accuracy-banner ${p.gpsStatus.status}`}>
+            <div className="gps-banner-icon">
+              {p.gpsStatus.status === 'locking' ? <span className="gps-pulse-ring"></span> : <Icon name="shield" size={16} />}
+            </div>
+            <div className="gps-banner-text">
+              <strong>{p.gpsStatus.message}</strong>
+              {p.gpsStatus.accuracy != null && (
+                <span className="gps-precision-sub">Satellite Precision: ±{p.gpsStatus.accuracy.toFixed(1)}m</span>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="gps-accuracy-banner idle">
+            <div className="gps-banner-icon">
+              <Icon name="location" size={14} />
+            </div>
+            <div className="gps-banner-text">
+              <span className="gps-precision-sub">🛰️ High-Precision Multi-Sample Satellite Lock active — filters out indoor drift on mobile.</span>
+            </div>
+          </div>
+        )}
+
       </section>
 
       {/* STUDENT COURSES & NOTIFICATIONS */}

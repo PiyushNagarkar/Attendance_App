@@ -1586,5 +1586,76 @@ input:focus, select:focus {
   }
 }
 
+/* =========================================================================
+   REAL-TIME GPS SATELLITE ACCURACY MONITOR
+   ========================================================================= */
+.gps-accuracy-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  margin-top: 14px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  background: var(--surface-alt);
+  transition: all 0.3s ease;
+}
+
+.gps-accuracy-banner.locking {
+  border-color: #93c5fd;
+  background: #eff6ff;
+  color: #1e40af;
+}
+
+.gps-accuracy-banner.locked {
+  border-color: #86efac;
+  background: #ecfdf5;
+  color: #065f46;
+}
+
+.gps-accuracy-banner.error {
+  border-color: #fca5a5;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.gps-accuracy-banner.idle {
+  border-color: var(--border);
+  background: var(--surface-alt);
+  color: var(--text-muted);
+}
+
+.gps-precision-sub {
+  display: block;
+  font-size: 11px;
+  opacity: 0.85;
+}
+
+.accuracy-pill-tag {
+  font-size: 11px;
+  font-weight: 600;
+  color: #047857;
+  background: #ecfdf5;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.gps-pulse-ring {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #3b82f6;
+  animation: pulse-ring 1.2s infinite ease-in-out;
+}
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.8); opacity: 0.8; }
+  50% { transform: scale(1.4); opacity: 0.3; }
+  100% { transform: scale(0.8); opacity: 0.8; }
+}
+
+
 
 
