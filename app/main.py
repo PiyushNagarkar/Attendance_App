@@ -18,26 +18,27 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from sqlalchemy.pool import NullPool
 
 load_dotenv()
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./attendance.db")
+RAW_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./attendance.db")
+DATABASE_URL = RAW_DATABASE_URL
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
 elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
+def build_engine(url: str):
+    if url.startswith("sqlite"):
+        return create_engine(url, connect_args={"check_same_thread": False})
+    return create_engine(url, poolclass=NullPool, pool_pre_ping=True)
 
-if DATABASE_URL.startswith("sqlite"):
-    engine = create_engine(
-        DATABASE_URL,
-        connect_args={"check_same_thread": False}
-    )
-else:
-    from sqlalchemy.pool import NullPool
+try:
+    engine = build_engine(DATABASE_URL)
+    with engine.connect() as _test_conn:
+        pass
+except Exception as e:
+    print(f"Warning: Primary database connection failed ({e}). Falling back to SQLite.")
+    DATABASE_URL = "sqlite:///./attendance.db"
+    engine = build_engine(DATABASE_URL)
 
-    engine = create_engine(
-        DATABASE_URL,
-        poolclass=NullPool,
-        pool_pre_ping=True
-    )
 SECRET_KEY = os.getenv("SECRET_KEY", "development-only-change-me")
 ALGORITHM = "HS256"
 
@@ -434,8 +435,10 @@ def healthz(s: Session = Depends(db)):
             "status": "ok",
             "users_count": user_count,
             "has_admin": admin is not None,
-            "db_dialect": engine.dialect.name
+            "db_dialect": engine.dialect.name,
+            "using_fallback": DATABASE_URL.startswith("sqlite") and RAW_DATABASE_URL != DATABASE_URL
         }
+
     except Exception as e:
         return {"status": "error", "error": str(e), "db_dialect": engine.dialect.name}
 
