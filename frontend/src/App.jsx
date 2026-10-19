@@ -599,13 +599,17 @@ function CollegeAdminPortal({ request, showNotice }) {
     building: 'Main Academic Block',
     room_number: '',
     floor: '1',
-    latitude: '',
-    longitude: '',
-    radius_m: '25',
+    buffer_m: '5',
+    corners: [
+      { lat: '', lng: '', label: 'Corner 1 (e.g. NW Front Door)' },
+      { lat: '', lng: '', label: 'Corner 2 (e.g. NE Window Edge)' },
+      { lat: '', lng: '', label: 'Corner 3 (e.g. SE Back Corner)' },
+      { lat: '', lng: '', label: 'Corner 4 (e.g. SW Back Door)' },
+    ],
   })
+  const [activeCornerIndex, setActiveCornerIndex] = useState(null)
   const [courseForm, setCourseForm] = useState({ code: '', name: '', section: 'A', classroom_id: '', teacher_id: '' })
   const [enrollForm, setEnrollForm] = useState({ course_id: '', student_id: '' })
-  const [isGeoDetecting, setIsGeoDetecting] = useState(false)
 
   const loadAll = async () => {
     try {
@@ -729,34 +733,44 @@ function CollegeAdminPortal({ request, showNotice }) {
     }
   }
 
-  // Geolocation auto-detector
-  const handleDetectCoordinates = () => {
-    setIsGeoDetecting(true)
-    showNotice('Requesting high-accuracy GPS coordinates from hardware...', 'info')
+  // 4-Corner Geolocation capture handler
+  const handleCaptureCorner = (index) => {
+    setActiveCornerIndex(index)
+    showNotice(`Stand at Corner ${index + 1} and hold your phone still... Capturing GPS...`, 'info')
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setRoomForm((prev) => ({
-          ...prev,
-          latitude: String(pos.coords.latitude),
-          longitude: String(pos.coords.longitude),
-        }))
-        setIsGeoDetecting(false)
+        setRoomForm((prev) => {
+          const updated = [...prev.corners]
+          updated[index] = {
+            ...updated[index],
+            lat: String(pos.coords.latitude),
+            lng: String(pos.coords.longitude),
+          }
+          return { ...prev, corners: updated }
+        })
+        setActiveCornerIndex(null)
         showNotice(
-          `✓ GPS Coordinates Captured: ${pos.coords.latitude.toFixed(6)}, ${pos.coords.longitude.toFixed(6)} (Accuracy ±${pos.coords.accuracy.toFixed(1)}m)`,
+          `✓ Corner ${index + 1} Captured: ${pos.coords.latitude.toFixed(6)}, ${pos.coords.longitude.toFixed(6)} (±${pos.coords.accuracy.toFixed(1)}m)`,
           'success'
         )
       },
       (err) => {
-        setIsGeoDetecting(false)
-        showNotice(`GPS Capture Failed: ${err.message}`, 'error')
+        setActiveCornerIndex(null)
+        showNotice(`GPS Capture Error: ${err.message}`, 'error')
       },
       { enableHighAccuracy: true, timeout: 15000 }
     )
   }
 
-  // Create Classroom
+  // Create Classroom with 4 Corners & 5m Buffer
   const handleCreateClassroom = async (e) => {
     e.preventDefault()
+    for (let i = 0; i < 4; i++) {
+      if (!roomForm.corners[i].lat || !roomForm.corners[i].lng) {
+        showNotice(`Please capture coordinates for Corner ${i + 1} before saving.`, 'warning')
+        return
+      }
+    }
     try {
       await request('/admin/classrooms', {
         method: 'POST',
@@ -764,19 +778,25 @@ function CollegeAdminPortal({ request, showNotice }) {
           building: roomForm.building,
           room_number: roomForm.room_number,
           floor: Number(roomForm.floor),
-          latitude: Number(roomForm.latitude),
-          longitude: Number(roomForm.longitude),
-          radius_m: Number(roomForm.radius_m),
+          buffer_m: Number(roomForm.buffer_m || 5),
+          corners: roomForm.corners.map((c) => ({
+            lat: Number(c.lat),
+            lng: Number(c.lng),
+          })),
         }),
       })
-      showNotice(`✓ Lecture Hall "${roomForm.room_number}" successfully added!`, 'success')
+      showNotice(`✓ Lecture Hall "${roomForm.room_number}" saved with 4-corner boundary & 5m buffer!`, 'success')
       setRoomForm({
         building: 'Main Academic Block',
         room_number: '',
         floor: '1',
-        latitude: '',
-        longitude: '',
-        radius_m: '25',
+        buffer_m: '5',
+        corners: [
+          { lat: '', lng: '', label: 'Corner 1 (e.g. NW Front Door)' },
+          { lat: '', lng: '', label: 'Corner 2 (e.g. NE Window Edge)' },
+          { lat: '', lng: '', label: 'Corner 3 (e.g. SE Back Corner)' },
+          { lat: '', lng: '', label: 'Corner 4 (e.g. SW Back Door)' },
+        ],
       })
       loadAll()
     } catch (err) {
@@ -1245,67 +1265,97 @@ function CollegeAdminPortal({ request, showNotice }) {
               <div className="gps-config-box">
                 <div className="gps-box-header">
                   <div>
-                    <strong>Classroom Coordinates (GPS)</strong>
-                    <div className="hint-text">Required for geofence validation</div>
+                    <strong>4-Corner Boundary Perimeter (Rectangle)</strong>
+                    <div className="hint-text">Walk to each corner of the room and tap capture</div>
                   </div>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={handleDetectCoordinates}
-                    disabled={isGeoDetecting}
-                  >
-                    <Icon name="location" size={14} /> {isGeoDetecting ? 'Detecting...' : 'Fetch My Location'}
-                  </button>
+                  <span className="status-tag status-present">Strict 4-Point Geofence</span>
                 </div>
 
-                <div className="row-2">
-                  <div className="input-group">
-                    <label>Latitude</label>
-                    <input
-                      value={roomForm.latitude}
-                      onChange={(e) => setRoomForm({ ...roomForm, latitude: e.target.value })}
-                      type="number"
-                      step="any"
-                      placeholder="e.g. 19.0760"
-                      required
-                    />
-                  </div>
-                  <div className="input-group">
-                    <label>Longitude</label>
-                    <input
-                      value={roomForm.longitude}
-                      onChange={(e) => setRoomForm({ ...roomForm, longitude: e.target.value })}
-                      type="number"
-                      step="any"
-                      placeholder="e.g. 72.8777"
-                      required
-                    />
-                  </div>
+                <div className="corners-grid">
+                  {roomForm.corners.map((corner, idx) => (
+                    <div key={idx} className="corner-card">
+                      <div className="corner-card-top">
+                        <span className="corner-num-badge">Corner {idx + 1}</span>
+                        <span className="corner-label-text">{corner.label}</span>
+                        {corner.lat && corner.lng ? (
+                          <span className="status-tag status-present">✓ Captured</span>
+                        ) : (
+                          <span className="status-tag status-late">Pending</span>
+                        )}
+                      </div>
+
+                      <div className="corner-coords-row">
+                        <input
+                          value={corner.lat}
+                          onChange={(e) => {
+                            const val = e.target.value
+                            setRoomForm((prev) => {
+                              const updated = [...prev.corners]
+                              updated[idx] = { ...updated[idx], lat: val }
+                              return { ...prev, corners: updated }
+                            })
+                          }}
+                          placeholder="Latitude"
+                          className="compact-input"
+                          required
+                        />
+                        <input
+                          value={corner.lng}
+                          onChange={(e) => {
+                            const val = e.target.value
+                            setRoomForm((prev) => {
+                              const updated = [...prev.corners]
+                              updated[idx] = { ...updated[idx], lng: val }
+                              return { ...prev, corners: updated }
+                            })
+                          }}
+                          placeholder="Longitude"
+                          className="compact-input"
+                          required
+                        />
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => handleCaptureCorner(idx)}
+                          disabled={activeCornerIndex !== null}
+                          title={`Walk to Corner ${idx + 1} and tap to record GPS`}
+                        >
+                          <Icon name="location" size={12} />
+                          {activeCornerIndex === idx ? 'Recording...' : 'Capture'}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
                 </div>
 
-                <div className="input-group" style={{ marginTop: '12px' }}>
-                  <label>Geofence Radius: <strong>{roomForm.radius_m} meters</strong></label>
+                <div className="input-group" style={{ marginTop: '14px' }}>
+                  <label>
+                    Perimeter Wall Buffer: <strong>{roomForm.buffer_m} meters</strong>
+                  </label>
+                  <div className="hint-text" style={{ marginBottom: '6px' }}>
+                    Tolerance margin outside the 4 walls to prevent false rejections from natural indoor satellite drift
+                  </div>
                   <div className="radius-presets">
                     <button
                       type="button"
-                      className={`preset-btn ${roomForm.radius_m === '15' ? 'active' : ''}`}
-                      onClick={() => setRoomForm({ ...roomForm, radius_m: '15' })}
+                      className={`preset-btn ${roomForm.buffer_m === '3' ? 'active' : ''}`}
+                      onClick={() => setRoomForm({ ...roomForm, buffer_m: '3' })}
                     >
-                      Lab (15m)
+                      Strict (3m)
                     </button>
                     <button
                       type="button"
-                      className={`preset-btn ${roomForm.radius_m === '25' ? 'active' : ''}`}
-                      onClick={() => setRoomForm({ ...roomForm, radius_m: '25' })}
+                      className={`preset-btn ${roomForm.buffer_m === '5' ? 'active' : ''}`}
+                      onClick={() => setRoomForm({ ...roomForm, buffer_m: '5' })}
                     >
-                      Standard (25m)
+                      Standard (5m)
                     </button>
                     <button
                       type="button"
-                      className={`preset-btn ${roomForm.radius_m === '45' ? 'active' : ''}`}
-                      onClick={() => setRoomForm({ ...roomForm, radius_m: '45' })}
+                      className={`preset-btn ${roomForm.buffer_m === '8' ? 'active' : ''}`}
+                      onClick={() => setRoomForm({ ...roomForm, buffer_m: '8' })}
                     >
-                      Auditorium (45m)
+                      Relaxed (8m)
                     </button>
                   </div>
                 </div>
@@ -1329,8 +1379,8 @@ function CollegeAdminPortal({ request, showNotice }) {
                   <tr>
                     <th>Room & Building</th>
                     <th>Floor</th>
-                    <th>GPS Coordinates</th>
-                    <th>Radius</th>
+                    <th>Geofence Boundary</th>
+                    <th>Buffer Margin</th>
                     <th className="text-right">Action</th>
                   </tr>
                 </thead>
@@ -1343,12 +1393,18 @@ function CollegeAdminPortal({ request, showNotice }) {
                       </td>
                       <td>Floor {c.floor}</td>
                       <td>
-                        <span className="coordinate-pill">
-                          <Icon name="location" size={12} /> {c.latitude.toFixed(4)}, {c.longitude.toFixed(4)}
-                        </span>
+                        {c.corners && c.corners.length >= 4 ? (
+                          <span className="coordinate-pill" title={c.corners.map((p, i) => `C${i+1}: ${p.lat.toFixed(4)}, ${p.lng.toFixed(4)}`).join(' | ')}>
+                            <Icon name="shield" size={12} /> ⬡ 4-Corner Rectangular Polygon
+                          </span>
+                        ) : (
+                          <span className="coordinate-pill">
+                            <Icon name="location" size={12} /> {c.latitude?.toFixed(4)}, {c.longitude?.toFixed(4)}
+                          </span>
+                        )}
                       </td>
                       <td>
-                        <span className="radius-pill">{c.radius_m}m</span>
+                        <span className="radius-pill">±{c.buffer_m || 5}m buffer</span>
                       </td>
                       <td className="text-right">
                         <button className="btn-action-danger" onClick={() => handleDeleteClassroom(c.id, c.room_number)}>

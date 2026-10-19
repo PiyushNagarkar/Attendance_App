@@ -1,4 +1,4 @@
-import base64, csv, io, math, os, secrets
+import base64, csv, io, json, math, os, secrets
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
@@ -72,7 +72,8 @@ class Classroom(Base):
     floor: Mapped[int]
     latitude: Mapped[float] = mapped_column(Float)
     longitude: Mapped[float] = mapped_column(Float)
-    radius_m: Mapped[float] = mapped_column(Float, default=25.0)
+    corners_json: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    buffer_m: Mapped[float] = mapped_column(Float, default=5.0)
 
 class Course(Base):
     __tablename__ = "courses"
@@ -150,6 +151,8 @@ with engine.connect() as conn:
         ("users", "semester INTEGER"),
         ("users", "bound_device_id VARCHAR(128)"),
         ("users", "device_bound_at DATETIME"),
+        ("classrooms", "corners_json TEXT"),
+        ("classrooms", "buffer_m FLOAT DEFAULT 5.0"),
     ]:
         try:
             conn.execute(text(f"ALTER TABLE {col_def[0]} ADD COLUMN {col_def[1]}"))
@@ -230,13 +233,16 @@ class BulkImportIn(BaseModel):
     default_password: str = "Student@123"
     course_id: Optional[int] = None
 
+class CornerPoint(BaseModel):
+    lat: float
+    lng: float
+
 class ClassroomIn(BaseModel):
     building: str
     room_number: str
     floor: int
-    latitude: float
-    longitude: float
-    radius_m: float = Field(default=25.0, ge=1, le=200)
+    corners: list[CornerPoint] = Field(min_length=4, max_length=4)
+    buffer_m: float = Field(default=5.0, ge=1.0, le=50.0)
 
 class CourseIn(BaseModel):
     code: str
@@ -302,6 +308,67 @@ def distance(a, b, c, d):
     lon = math.radians(d - b)
     x = math.sin(lat / 2) ** 2 + math.cos(math.radians(a)) * math.cos(math.radians(c)) * math.sin(lon / 2) ** 2
     return 2 * radius * math.asin(math.sqrt(x))
+
+def point_to_segment_distance(px, py, ax, ay, bx, by):
+    dx = bx - ax
+    dy = by - ay
+    l2 = dx * dx + dy * dy
+    if l2 == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+    proj_x = ax + t * dx
+    proj_y = ay + t * dy
+    return math.hypot(px - proj_x, py - proj_y)
+
+def is_inside_polygon(px, py, poly_xy):
+    n = len(poly_xy)
+    inside = False
+    p1x, p1y = poly_xy[0]
+    for i in range(1, n + 1):
+        p2x, p2y = poly_xy[i % n]
+        if min(p1y, p2y) < py <= max(p1y, p2y):
+            if p2y != p1y:
+                x_inters = (py - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                if px <= x_inters:
+                    inside = not inside
+        p1x, p1y = p2x, p2y
+    return inside
+
+def verify_4corner_geofence(student_lat, student_lon, corners, buffer_m=5.0):
+    if not corners or len(corners) < 4:
+        return False, 999.0
+
+    ref_lat = sum(c["lat"] for c in corners[:4]) / 4.0
+    ref_lon = sum(c["lng"] for c in corners[:4]) / 4.0
+    R = 6371000.0
+    cos_ref = math.cos(math.radians(ref_lat))
+
+    poly_xy = []
+    for c in corners[:4]:
+        x = R * math.radians(c["lng"] - ref_lon) * cos_ref
+        y = R * math.radians(c["lat"] - ref_lat)
+        poly_xy.append((x, y))
+
+    stu_x = R * math.radians(student_lon - ref_lon) * cos_ref
+    stu_y = R * math.radians(student_lat - ref_lat)
+
+    # 1. Check if strictly inside 4-corner boundary
+    if is_inside_polygon(stu_x, stu_y, poly_xy):
+        return True, 0.0
+
+    # 2. Check distance to 4 perimeter edges
+    min_dist = float("inf")
+    for i in range(4):
+        ax, ay = poly_xy[i]
+        bx, by = poly_xy[(i + 1) % 4]
+        d = point_to_segment_distance(stu_x, stu_y, ax, ay, bx, by)
+        if d < min_dist:
+            min_dist = d
+
+    if min_dist <= buffer_m:
+        return True, min_dist
+
+    return False, min_dist
 
 def qr_payload(row):
     image = qrcode.make(row.token)
@@ -559,25 +626,45 @@ def delete_user(user_id: int, s: Session = Depends(db), admin: User = Depends(re
 
 @app.get("/admin/classrooms")
 def classrooms(s: Session = Depends(db), _: User = Depends(require(Role.ADMIN))):
-    return [
-        {
+    res = []
+    for x in s.query(Classroom).order_by(Classroom.room_number):
+        parsed_corners = []
+        if x.corners_json:
+            try:
+                parsed_corners = json.loads(x.corners_json)
+            except Exception:
+                parsed_corners = []
+        res.append({
             "id": x.id,
             "building": x.building,
             "room_number": x.room_number,
             "floor": x.floor,
             "latitude": x.latitude,
             "longitude": x.longitude,
-            "radius_m": x.radius_m,
-        }
-        for x in s.query(Classroom).order_by(Classroom.room_number)
-    ]
+            "corners": parsed_corners,
+            "buffer_m": x.buffer_m if x.buffer_m is not None else 5.0,
+        })
+    return res
 
 @app.post("/admin/classrooms")
 def classroom(data: ClassroomIn, s: Session = Depends(db), _: User = Depends(require(Role.ADMIN))):
     existing = s.query(Classroom).filter_by(room_number=data.room_number).first()
     if existing:
         raise HTTPException(409, f"Room '{data.room_number}' already exists")
-    row = Classroom(**data.model_dump())
+
+    avg_lat = sum(c.lat for c in data.corners) / 4.0
+    avg_lng = sum(c.lng for c in data.corners) / 4.0
+    corners_payload = [{"lat": c.lat, "lng": c.lng} for c in data.corners]
+
+    row = Classroom(
+        building=data.building,
+        room_number=data.room_number,
+        floor=data.floor,
+        latitude=avg_lat,
+        longitude=avg_lng,
+        corners_json=json.dumps(corners_payload),
+        buffer_m=data.buffer_m,
+    )
     s.add(row)
     s.commit()
     return {"id": row.id, "room_number": row.room_number}
@@ -917,15 +1004,43 @@ def checkin(data: CheckIn, s: Session = Depends(db), student: User = Depends(req
     room = s.get(Classroom, course.classroom_id) if course else None
     if not room:
         raise HTTPException(500, "Classroom configuration missing")
-    metres = distance(data.latitude, data.longitude, room.latitude, room.longitude)
-    if metres > room.radius_m:
-        raise HTTPException(403, f"Outside classroom geofence ({metres:.1f}m away; maximum radius is {room.radius_m}m)")
-    if data.gps_accuracy_m > max(room.radius_m * 1.5, 45.0):
+
+    # 4-Corner Rectangular Geofence with 5m Buffer
+    buffer_allowed = room.buffer_m if room.buffer_m is not None else 5.0
+    dist_to_boundary = 0.0
+
+    if room.corners_json:
+        try:
+            corners = json.loads(room.corners_json)
+        except Exception:
+            corners = []
+
+        if len(corners) >= 4:
+            is_valid, dist_to_boundary = verify_4corner_geofence(
+                data.latitude, data.longitude, corners, buffer_m=buffer_allowed
+            )
+            if not is_valid:
+                raise HTTPException(
+                    403,
+                    f"Outside classroom boundary ({dist_to_boundary:.1f}m outside nearest wall; allowed buffer is {buffer_allowed:.0f}m)"
+                )
+        else:
+            metres = distance(data.latitude, data.longitude, room.latitude, room.longitude)
+            if metres > buffer_allowed:
+                raise HTTPException(403, f"Outside classroom boundary ({metres:.1f}m away; allowed buffer is {buffer_allowed:.0f}m)")
+            dist_to_boundary = metres
+    else:
+        metres = distance(data.latitude, data.longitude, room.latitude, room.longitude)
+        if metres > buffer_allowed:
+            raise HTTPException(403, f"Outside classroom boundary ({metres:.1f}m away; allowed buffer is {buffer_allowed:.0f}m)")
+        dist_to_boundary = metres
+
+    if data.gps_accuracy_m > 45.0:
         raise HTTPException(422, f"GPS accuracy is too low (±{data.gps_accuracy_m:.1f}m). Please move closer to a window and retry.")
     
-    s.add(Attendance(session_id=row.id, student_id=student.id, marked_at=datetime.utcnow(), distance_m=metres, gps_accuracy_m=data.gps_accuracy_m, status="present"))
+    s.add(Attendance(session_id=row.id, student_id=student.id, marked_at=datetime.utcnow(), distance_m=dist_to_boundary, gps_accuracy_m=data.gps_accuracy_m, status="present"))
     s.commit()
-    return {"status": "present", "distance_m": round(metres, 2), "message": "✓ Verified Location & Device: Attendance marked successfully!"}
+    return {"status": "present", "distance_m": round(dist_to_boundary, 2), "message": f"✓ Verified inside classroom boundary ({buffer_allowed:.0f}m buffer)!"}
 
 @app.get("/student/dashboard")
 def student_dashboard(s: Session = Depends(db), student: User = Depends(require(Role.STUDENT))):
