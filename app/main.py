@@ -425,13 +425,31 @@ def low_notifications(s: Session, course: Course, threshold: float = 75.0):
 def home():
     return {"message": "Smart Attendance API is running"}
 
+@app.get("/healthz")
+def healthz(s: Session = Depends(db)):
+    try:
+        user_count = s.query(User).count()
+        admin = s.query(User).filter_by(email="admin@attendance.app").first()
+        return {
+            "status": "ok",
+            "users_count": user_count,
+            "has_admin": admin is not None,
+            "db_dialect": engine.dialect.name
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e), "db_dialect": engine.dialect.name}
+
 @app.post("/auth/login", response_model=Token)
 def login(data: Login, s: Session = Depends(db)):
-    user = s.query(User).filter_by(email=data.email).first()
+    try:
+        user = s.query(User).filter_by(email=data.email).first()
+    except Exception as e:
+        raise HTTPException(500, f"Database query error: {e}")
     if not user or not pwd.verify(data.password, user.password_hash):
         raise HTTPException(401, "Invalid email or password")
     token = jwt.encode({"sub": str(user.id), "exp": datetime.now(timezone.utc) + timedelta(minutes=180)}, SECRET_KEY, algorithm=ALGORITHM)
     return {"access_token": token, "role": user.role, "name": user.name}
+
 
 # --- ADMIN ENDPOINTS ---
 @app.get("/admin/dashboard")
