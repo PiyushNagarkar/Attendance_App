@@ -3,4 +3,8 @@ __pycache__/
 *.pyc
 attendance.db
 .env
+Attendance_App/
+frontend/node_modules/
+frontend/dist/
+
 

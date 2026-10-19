@@ -8,3 +8,4 @@ python-dotenv
 qrcode[pil]
 reportlab
 psycopg[binary]
+psycopg2-binary

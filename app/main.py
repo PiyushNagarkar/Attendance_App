@@ -20,7 +20,10 @@ from sqlalchemy.pool import NullPool
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./attendance.db")
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://") and not DATABASE_URL.startswith("postgresql+"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
 
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(
@@ -140,25 +143,32 @@ class TimetableSlot(Base):
     start_time: Mapped[str] = mapped_column(String(10))  # e.g. "09:30"
     end_time: Mapped[str] = mapped_column(String(10))  # e.g. "10:30"
 
-Base.metadata.create_all(engine)
+try:
+    Base.metadata.create_all(engine)
+except Exception as e:
+    print(f"Database init warning: {e}")
 
 # Auto-migration safety for existing tables
-with engine.connect() as conn:
-    for col_def in [
-        ("attendance_sessions", "prev_token VARCHAR(128)"),
-        ("users", "roll_number VARCHAR(64)"),
-        ("users", "department VARCHAR(100)"),
-        ("users", "semester INTEGER"),
-        ("users", "bound_device_id VARCHAR(128)"),
-        ("users", "device_bound_at DATETIME"),
-        ("classrooms", "corners_json TEXT"),
-        ("classrooms", "buffer_m FLOAT DEFAULT 5.0"),
-    ]:
-        try:
-            conn.execute(text(f"ALTER TABLE {col_def[0]} ADD COLUMN {col_def[1]}"))
-            conn.commit()
-        except Exception:
-            pass
+try:
+    with engine.connect() as conn:
+        for col_def in [
+            ("attendance_sessions", "prev_token VARCHAR(128)"),
+            ("users", "roll_number VARCHAR(64)"),
+            ("users", "department VARCHAR(100)"),
+            ("users", "semester INTEGER"),
+            ("users", "bound_device_id VARCHAR(128)"),
+            ("users", "device_bound_at DATETIME"),
+            ("classrooms", "corners_json TEXT"),
+            ("classrooms", "buffer_m FLOAT DEFAULT 5.0"),
+        ]:
+            try:
+                conn.execute(text(f"ALTER TABLE {col_def[0]} ADD COLUMN {col_def[1]}"))
+                conn.commit()
+            except Exception:
+                pass
+except Exception as e:
+    print(f"Auto-migration init warning: {e}")
+
 
 # Automatic initial admin & demo seed on fresh deployment
 try:
