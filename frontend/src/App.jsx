@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from 'react'
 import { BrowserQRCodeReader } from '@zxing/browser'
 import './App.css'
 
-const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'
+const API =
+  import.meta.env.VITE_API_URL ||
+  (typeof window !== 'undefined' &&
+  window.location.hostname !== 'localhost' &&
+  window.location.hostname !== '127.0.0.1'
+    ? 'https://attendance-app-backend-l075.onrender.com'
+    : 'http://127.0.0.1:8000')
 
 // --- SVG Icons Helper ---
 function Icon({ name, size = 18, className = '' }) {
@@ -134,76 +140,177 @@ function Icon({ name, size = 18, className = '' }) {
   )
 }
 
-// High-Precision Multi-Sample GPS Acquisition
-function acquireHighPrecisionGPS({ onProgress, onSuccess, onError, timeoutMs = 4500, targetAccuracy = 7.0 }) {
-  if (!navigator.geolocation) {
+// Persistent Hardware Device ID for Anti-Proxy Security
+function getOrCreateDeviceId() {
+  try {
+    let devId = localStorage.getItem('attendance_device_id')
+    if (!devId) {
+      devId =
+        'dev_' +
+        (typeof crypto !== 'undefined' && crypto.randomUUID
+          ? crypto.randomUUID()
+          : Math.random().toString(36).slice(2) + Date.now().toString(36))
+      localStorage.setItem('attendance_device_id', devId)
+    }
+    return devId
+  } catch {
+    return 'dev_browser_fallback_' + Date.now().toString(36)
+  }
+}
+
+// Haversine distance in meters between two coordinates
+function haversineDistM(lat1, lon1, lat2, lon2) {
+  const R = 6371000
+  const dLat = ((lat2 - lat1) * Math.PI) / 180
+  const dLon = ((lon2 - lon1) * Math.PI) / 180
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2)
+  return 2 * R * Math.asin(Math.sqrt(a))
+}
+
+// Compute maximum spread (in meters) across valid collected GPS readings
+function calculateSpreadM(samples) {
+  if (samples.length <= 1) return 0.0
+  let maxD = 0.0
+  for (let i = 0; i < samples.length; i++) {
+    for (let j = i + 1; j < samples.length; j++) {
+      const d = haversineDistM(
+        samples[i].latitude,
+        samples[i].longitude,
+        samples[j].latitude,
+        samples[j].longitude
+      )
+      if (d > maxD) maxD = d
+    }
+  }
+  return maxD
+}
+
+// Parallel Location Acquisition with Outlier Rejection & Sample Spread
+function startParallelGPS({ onProgress, onUsableFix, onFinish, onError, timeoutMs = 5500 }) {
+  if (typeof navigator === 'undefined' || !navigator.geolocation) {
     return onError(new Error('Geolocation is not supported by your browser.'))
   }
 
-  let bestPosition = null
+  const startTime = performance.now()
+  const rawSamples = []
+  let bestFix = null
   let watchId = null
-  let timeoutId = null
-  let sampleCount = 0
+  let timeoutTimer = null
+  let hasSignaledUsable = false
 
-  const finish = () => {
+  const evaluateAndSignal = (force = false) => {
+    // Filter obvious outliers (>100m accuracy when better exists)
+    const valid = rawSamples.filter((s) => s.accuracy <= 100)
+    const candidates = valid.length > 0 ? valid : rawSamples
+    if (!candidates.length) return null
+
+    // Best reading by lowest error radius
+    let best = candidates[0]
+    for (const c of candidates) {
+      if (c.accuracy < best.accuracy) best = c
+    }
+
+    // Outlier distance check if multiple readings exist
+    const filtered = candidates.filter(
+      (c) => haversineDistM(c.latitude, c.longitude, best.latitude, best.longitude) <= 80
+    )
+    const activeCluster = filtered.length > 0 ? filtered : candidates
+    const spread = calculateSpreadM(activeCluster)
+
+    const fixResult = {
+      latitude: best.latitude,
+      longitude: best.longitude,
+      accuracy: best.accuracy,
+      sampleCount: activeCluster.length,
+      sampleSpread: Math.round(spread * 10) / 10,
+      acquisitionTimeMs: Math.round(performance.now() - startTime),
+    }
+
+    bestFix = fixResult
+
+    // Usable fix criteria:
+    // 1. Accuracy <= 16m (high quality satellite lock - immediate!)
+    // 2. >= 2 samples with accuracy <= 28m
+    // 3. Forced on bounded timeout (takes best sample available)
+    const isUsable =
+      force ||
+      fixResult.accuracy <= 16.0 ||
+      (activeCluster.length >= 2 && fixResult.accuracy <= 28.0)
+
+    if (isUsable && !hasSignaledUsable) {
+      hasSignaledUsable = true
+      if (onUsableFix) onUsableFix(fixResult)
+    }
+
+    return fixResult
+  }
+
+  const cleanup = () => {
     if (watchId !== null) {
       navigator.geolocation.clearWatch(watchId)
       watchId = null
     }
-    if (timeoutId !== null) {
-      clearTimeout(timeoutId)
-      timeoutId = null
-    }
-
-    if (bestPosition) {
-      onSuccess(bestPosition)
-    } else {
-      onError(new Error('Could not acquire GPS satellite signal. Ensure Location Services are ON with High Accuracy.'))
+    if (timeoutTimer !== null) {
+      clearTimeout(timeoutTimer)
+      timeoutTimer = null
     }
   }
 
-  timeoutId = setTimeout(finish, timeoutMs)
+  timeoutTimer = setTimeout(() => {
+    const finalFix = evaluateAndSignal(true)
+    cleanup()
+    if (finalFix) {
+      if (onFinish) onFinish(finalFix)
+    } else {
+      onError(new Error('GPS signal timed out. Ensure location services are on with High Accuracy.'))
+    }
+  }, timeoutMs)
 
   try {
     watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        sampleCount++
-        const acc = pos.coords.accuracy
+        const item = {
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+          time: performance.now(),
+        }
+        rawSamples.push(item)
 
-        if (onProgress) {
-          onProgress({
-            accuracy: acc,
-            latitude: pos.coords.latitude,
-            longitude: pos.coords.longitude,
-            sampleCount,
-          })
+        const currentFix = evaluateAndSignal(false)
+        if (onProgress && currentFix) {
+          onProgress(currentFix)
         }
 
-        if (!bestPosition || acc < bestPosition.coords.accuracy) {
-          bestPosition = pos
-        }
-
-        // If high precision is acquired (e.g. <= targetAccuracy), finish early
-        if (acc <= targetAccuracy) {
-          finish()
+        // If target precision is excellent (<= 8m), conclude early
+        if (currentFix && currentFix.accuracy <= 8.0) {
+          cleanup()
+          if (onFinish) onFinish(currentFix)
         }
       },
       (err) => {
-        if (!bestPosition) {
-          if (watchId !== null) navigator.geolocation.clearWatch(watchId)
-          if (timeoutId !== null) clearTimeout(timeoutId)
+        if (!rawSamples.length) {
+          cleanup()
           onError(err)
         }
       },
       {
         enableHighAccuracy: true,
-        maximumAge: 0, // CRITICAL: Never reuse stale cached coordinates
+        maximumAge: 0,
         timeout: timeoutMs,
       }
     )
   } catch (err) {
-    finish()
+    cleanup()
+    onError(err)
   }
+
+  return cleanup
 }
 
 function App() {
@@ -231,8 +338,19 @@ function App() {
   const [studentData, setStudentData] = useState(null)
   const [qrToken, setQrToken] = useState('')
   const [scanning, setScanning] = useState(false)
+  const [locationStatus, setLocationStatus] = useState('finding')
+  const [locationFix, setLocationFix] = useState(null)
+  const [locationError, setLocationError] = useState(null)
+  const [checkinStage, setCheckinStage] = useState('finding_location')
+  const [checkinResult, setCheckinResult] = useState(null)
   const videoRef = useRef(null)
   const scanControls = useRef(null)
+  const locationFixRef = useRef(null)
+  const pendingQrTokenRef = useRef(null)
+  const scanStartTimeRef = useRef(null)
+  const scanDurationRef = useRef(0)
+  const isSubmittingRef = useRef(false)
+  const locationCleanupRef = useRef(null)
 
   const showNotice = (text, type = 'info') => {
     setNotice({ text, type })
@@ -387,68 +505,160 @@ function App() {
     }
   }
 
-  const checkIn = () => {
-    if (!qrToken) return showNotice('Please scan the live classroom QR first.', 'warning')
-    setGpsLocking(true)
-    setGpsStatus({ status: 'locking', accuracy: null, message: '🛰️ Connecting to GPS satellites...' })
-    showNotice('🛰️ Acquiring multi-sample GPS satellite lock... Hold your phone steady for 3s.', 'info')
+  // Parallel Location Acquisition Effect for Student
+  useEffect(() => {
+    if (role !== 'student' || !token) return
 
-    acquireHighPrecisionGPS({
-      timeoutMs: 4500,
-      targetAccuracy: 8.0,
-      onProgress: (info) => {
-        setGpsStatus({
-          status: 'locking',
-          accuracy: info.accuracy,
-          message: `Sampling GPS satellite fix (${info.sampleCount}): ±${info.accuracy.toFixed(1)}m precision`,
-        })
+    if (locationCleanupRef.current) {
+      locationCleanupRef.current()
+      locationCleanupRef.current = null
+    }
+
+    setLocationStatus('finding')
+    setLocationError(null)
+    setCheckinStage('finding_location')
+
+    const cleanup = startParallelGPS({
+      timeoutMs: 5500,
+      onProgress: (fix) => {
+        locationFixRef.current = fix
+        setLocationFix(fix)
+        setCheckinStage((prev) => (prev === 'finding_location' ? 'scan_qr' : prev))
       },
-      onSuccess: async (bestPos) => {
-        const { latitude, longitude, accuracy } = bestPos.coords
-        setGpsStatus({
-          status: 'locked',
-          accuracy,
-          message: `✓ High-precision satellite lock acquired (±${accuracy.toFixed(1)}m)! Validating boundary...`,
-        })
-        try {
-          const x = await request('/student/check-in', {
-            method: 'POST',
-            body: JSON.stringify({
-              token: qrToken,
-              latitude,
-              longitude,
-              gps_accuracy_m: accuracy,
-            }),
-          })
-          showNotice(x.message, 'success')
-          setQrToken('')
-          setGpsStatus(null)
-          setGpsLocking(false)
-          await loadStudent()
-        } catch (e) {
-          showNotice(e.message, 'error')
-          setGpsStatus({ status: 'error', accuracy, message: e.message })
-          setGpsLocking(false)
+      onUsableFix: (usableFix) => {
+        locationFixRef.current = usableFix
+        setLocationFix(usableFix)
+        setLocationStatus('ready')
+        setCheckinStage((prev) => (prev === 'finding_location' ? 'scan_qr' : prev))
+
+        // Requirement 2: Submit as soon as there is a usable location fix.
+        if (pendingQrTokenRef.current && !isSubmittingRef.current) {
+          const tok = pendingQrTokenRef.current
+          pendingQrTokenRef.current = null
+          submitCheckin(tok, usableFix, scanDurationRef.current || 0)
+        }
+      },
+      onFinish: (finalFix) => {
+        locationFixRef.current = finalFix
+        setLocationFix(finalFix)
+        setLocationStatus('ready')
+        if (pendingQrTokenRef.current && !isSubmittingRef.current) {
+          const tok = pendingQrTokenRef.current
+          pendingQrTokenRef.current = null
+          submitCheckin(tok, finalFix, scanDurationRef.current || 0)
         }
       },
       onError: (err) => {
-        setGpsLocking(false)
-        setGpsStatus(null)
-        showNotice(`Location Error: ${err.message}. Please enable High Accuracy Location access.`, 'error')
+        setLocationStatus('error')
+        setLocationError(err.message)
+        if (pendingQrTokenRef.current && !isSubmittingRef.current) {
+          const tok = pendingQrTokenRef.current
+          pendingQrTokenRef.current = null
+          submitCheckin(tok, null, scanDurationRef.current || 0, err.message)
+        }
       },
     })
+
+    locationCleanupRef.current = cleanup
+
+    return () => {
+      if (locationCleanupRef.current) {
+        locationCleanupRef.current()
+        locationCleanupRef.current = null
+      }
+    }
+  }, [role, token])
+
+  const submitCheckin = async (tokenStr, fix, scanMs = 0, locError = null) => {
+    if (isSubmittingRef.current) return
+    isSubmittingRef.current = true
+    setCheckinStage('submitting')
+    const reqStart = performance.now()
+
+    try {
+      const payload = {
+        token: tokenStr,
+        latitude: fix ? fix.latitude : null,
+        longitude: fix ? fix.longitude : null,
+        gps_accuracy_m: fix ? fix.accuracy : null,
+        device_id: getOrCreateDeviceId(),
+        location_time_ms: fix ? fix.acquisitionTimeMs : null,
+        scan_time_ms: scanMs,
+        sample_count: fix ? fix.sampleCount : 0,
+        sample_spread_m: fix ? fix.sampleSpread : 0.0,
+        review_requested: !fix || Boolean(locError),
+        review_reason: locError ? `Client GPS error: ${locError}` : null,
+      }
+
+      const res = await request('/student/check-in', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+
+      const reqMs = Math.round(performance.now() - reqStart)
+      const fullRes = {
+        ...res,
+        timing: {
+          locMs: fix ? fix.acquisitionTimeMs : 0,
+          scanMs: scanMs || 0,
+          reqMs,
+        },
+      }
+      setCheckinResult(fullRes)
+
+      if (res.status === 'present') {
+        setCheckinStage('marked')
+        showNotice(res.message, 'success')
+      } else if (res.status === 'needs_review') {
+        setCheckinStage('needs_review')
+        showNotice(res.message, 'warning')
+      } else {
+        setCheckinStage('marked')
+        showNotice(res.message, 'info')
+      }
+
+      await loadStudent()
+    } catch (err) {
+      const reqMs = Math.round(performance.now() - reqStart)
+      setCheckinResult({
+        status: 'error',
+        message: err.message,
+        timing: {
+          locMs: fix ? fix.acquisitionTimeMs : 0,
+          scanMs: scanMs || 0,
+          reqMs,
+        },
+      })
+      setCheckinStage('error')
+      showNotice(err.message, 'error')
+    } finally {
+      isSubmittingRef.current = false
+    }
   }
 
   const startScanner = async () => {
     try {
       setScanning(true)
+      scanStartTimeRef.current = performance.now()
       const reader = new BrowserQRCodeReader()
       scanControls.current = await reader.decodeFromVideoDevice(undefined, videoRef.current, (result) => {
         if (result) {
-          setQrToken(result.getText())
+          const scanDuration = Math.round(performance.now() - (scanStartTimeRef.current || performance.now()))
+          scanDurationRef.current = scanDuration
+          const scannedText = result.getText()
+          setQrToken(scannedText)
           scanControls.current?.stop()
           setScanning(false)
-          showNotice('✓ QR code detected! Click "Verify Location & Mark Attendance".', 'success')
+
+          // If usable fix is already ready, submit immediately!
+          if (locationFixRef.current) {
+            submitCheckin(scannedText, locationFixRef.current, scanDuration)
+          } else if (locationError) {
+            submitCheckin(scannedText, null, scanDuration, locationError)
+          } else {
+            pendingQrTokenRef.current = scannedText
+            showNotice('✓ QR code detected! Finalizing GPS position...', 'info')
+          }
         }
       })
     } catch {
@@ -460,6 +670,17 @@ function App() {
   const stopScanner = () => {
     scanControls.current?.stop()
     setScanning(false)
+  }
+
+  const handleManualCheckIn = () => {
+    if (!qrToken) return showNotice('Please enter or scan a valid QR token.', 'warning')
+    submitCheckin(qrToken, locationFixRef.current, 0, locationError)
+  }
+
+  const resetCheckin = () => {
+    setQrToken('')
+    setCheckinResult(null)
+    setCheckinStage(locationFixRef.current ? 'scan_qr' : 'finding_location')
   }
 
   const loadReport = async () => {
@@ -653,9 +874,13 @@ function App() {
             stopScanner={stopScanner}
             qrToken={qrToken}
             setQrToken={setQrToken}
-            checkIn={checkIn}
-            gpsStatus={gpsStatus}
-            gpsLocking={gpsLocking}
+            checkIn={handleManualCheckIn}
+            checkinStage={checkinStage}
+            checkinResult={checkinResult}
+            locationStatus={locationStatus}
+            locationFix={locationFix}
+            locationError={locationError}
+            resetCheckin={resetCheckin}
           />
 
         )}
@@ -1888,6 +2113,11 @@ function CollegeFacultyPortal(p) {
               </div>
               <div className="roster-metrics-badge">
                 <strong>{presentCount} / {totalCount}</strong> Present ({attendanceRate}%)
+                {p.enrolledStatus.filter((s) => s.status === 'needs_review').length > 0 && (
+                  <span className="roster-review-alert-badge">
+                    ⚠️ {p.enrolledStatus.filter((s) => s.status === 'needs_review').length} Review Needed
+                  </span>
+                )}
               </div>
             </div>
 
@@ -1916,13 +2146,21 @@ function CollegeFacultyPortal(p) {
                       <td>
                         <strong>{st.name}</strong>
                         <div className="id-sub">{st.email}</div>
+                        {st.review_reason && (
+                          <div className="roster-review-reason-text">⚠️ {st.review_reason}</div>
+                        )}
                       </td>
                       <td>
-                        <span className={`status-tag status-${st.status}`}>{st.status}</span>
+                        <span className={`status-tag status-${st.status}`}>
+                          {st.status === 'needs_review' ? 'Needs Review' : st.status}
+                        </span>
                       </td>
                       <td>
                         {st.distance_m != null ? (
-                          <span className="dist-text">{st.distance_m}m</span>
+                          <span className="dist-text">
+                            {st.distance_m}m
+                            {st.gps_accuracy_m != null ? ` (±${st.gps_accuracy_m}m)` : ''}
+                          </span>
                         ) : (
                           <span className="dist-text muted">—</span>
                         )}
@@ -2062,65 +2300,143 @@ function CollegeStudentPortal(p) {
           <p>Scan the rotating QR code projected by your professor while inside the lecture hall.</p>
         </div>
 
-        <div className="scanner-action-zone">
-          {p.scanning ? (
-            <div className="camera-viewfinder-box">
-              <video className="scanner-video" ref={p.videoRef} />
-              <div className="scanner-overlay-grid">
-                <div className="laser-scanner-line"></div>
-              </div>
-              <button className="btn btn-secondary btn-sm scanner-cancel" onClick={p.stopScanner}>
-                ✕ Close Camera
-              </button>
+        {/* 1. Concise Location & Scanner Status Bar */}
+        <div className="checkin-status-row">
+          {p.locationStatus === 'finding' && (
+            <div className="concise-status-pill status-finding">
+              <span className="gps-pulse-ring"></span>
+              <span>Finding location…</span>
+              {p.locationFix && <span className="pill-sub">±{p.locationFix.accuracy.toFixed(1)}m</span>}
             </div>
-          ) : (
-            <div className="open-camera-hero" onClick={p.startScanner}>
-              <div className="cam-icon-circle"><Icon name="camera" size={32} /></div>
-              <h3>Tap to Launch Camera Scanner</h3>
-              <p>Scan the dynamic QR on the lecture hall screen</p>
+          )}
+
+          {p.locationStatus === 'ready' && (
+            <div className="concise-status-pill status-ready">
+              <Icon name="check" size={14} />
+              <span>Location ready (±{p.locationFix?.accuracy?.toFixed(1)}m in {p.locationFix?.acquisitionTimeMs}ms)</span>
+            </div>
+          )}
+
+          {(p.locationStatus === 'error' || p.locationError) && (
+            <div className="concise-status-pill status-warning">
+              <Icon name="shield" size={14} />
+              <span>Location unavailable: {p.locationError || 'Signal lost'}. Teacher review enabled.</span>
             </div>
           )}
         </div>
 
-        <div className="qr-input-submit-row">
-          <div className="input-group flex-1">
-            <label>Scanned QR Token</label>
-            <input
-              value={p.qrToken}
-              onChange={(e) => p.setQrToken(e.target.value)}
-              placeholder="QR token automatically populates here upon scan..."
-            />
-          </div>
-
-          <button className="btn btn-primary btn-lg" onClick={p.checkIn} disabled={!p.qrToken || p.gpsLocking}>
-            <Icon name="location" size={18} /> {p.gpsLocking ? 'Locking Satellites...' : 'Verify Location & Check In'}
-          </button>
-        </div>
-
-        {/* Real-time Satellite GPS Accuracy Monitor */}
-        {p.gpsStatus ? (
-          <div className={`gps-accuracy-banner ${p.gpsStatus.status}`}>
-            <div className="gps-banner-icon">
-              {p.gpsStatus.status === 'locking' ? <span className="gps-pulse-ring"></span> : <Icon name="shield" size={16} />}
+        {/* 2. Success / Needs Review / Error Outcome Cards */}
+        {p.checkinStage === 'marked' && (
+          <div className="checkin-outcome-box outcome-marked">
+            <div className="outcome-icon-circle mark-success">
+              <Icon name="check" size={28} />
             </div>
-            <div className="gps-banner-text">
-              <strong>{p.gpsStatus.message}</strong>
-              {p.gpsStatus.accuracy != null && (
-                <span className="gps-precision-sub">Satellite Precision: ±{p.gpsStatus.accuracy.toFixed(1)}m</span>
-              )}
+            <div className="outcome-text">
+              <h3>Attendance marked</h3>
+              <p>{p.checkinResult?.message || '✓ Verified inside classroom boundary'}</p>
+              <div className="outcome-diagnostics">
+                <span>Boundary: <strong>{p.checkinResult?.distance_m ?? 0}m</strong></span>
+                <span>GPS Error: <strong>±{p.checkinResult?.gps_accuracy_m ?? p.locationFix?.accuracy?.toFixed(1) ?? 0}m</strong></span>
+                <span>Loc: <strong>{p.checkinResult?.timing?.locMs ?? 0}ms</strong></span>
+                <span>Scan: <strong>{p.checkinResult?.timing?.scanMs ?? 0}ms</strong></span>
+                <span>Roundtrip: <strong>{p.checkinResult?.timing?.reqMs ?? 0}ms</strong></span>
+              </div>
             </div>
-          </div>
-        ) : (
-          <div className="gps-accuracy-banner idle">
-            <div className="gps-banner-icon">
-              <Icon name="location" size={14} />
-            </div>
-            <div className="gps-banner-text">
-              <span className="gps-precision-sub">🛰️ High-Precision Multi-Sample Satellite Lock active — filters out indoor drift on mobile.</span>
-            </div>
+            <button className="btn btn-secondary btn-sm" onClick={p.resetCheckin}>
+              Check In Another Lecture
+            </button>
           </div>
         )}
 
+        {p.checkinStage === 'needs_review' && (
+          <div className="checkin-outcome-box outcome-review">
+            <div className="outcome-icon-circle mark-review">
+              <Icon name="shield" size={28} />
+            </div>
+            <div className="outcome-text">
+              <h3>Needs teacher review</h3>
+              <p className="review-reason-lead">
+                {p.checkinResult?.review_reason || 'GPS fix was uncertain indoors near the classroom boundary.'}
+              </p>
+              <p className="review-explanation">
+                Your rotating QR token and registered device were verified. Your attendance has been logged and sent to your professor’s live lecture roster for one-click approval.
+              </p>
+              <div className="outcome-diagnostics">
+                <span>Boundary: <strong>{p.checkinResult?.distance_m ?? 0}m</strong></span>
+                <span>GPS Error: <strong>±{p.checkinResult?.gps_accuracy_m ?? 0}m</strong></span>
+                <span>Samples: <strong>{p.locationFix?.sampleCount ?? 1}</strong></span>
+                <span>Spread: <strong>{p.locationFix?.sampleSpread ?? 0}m</strong></span>
+                <span>Loc: <strong>{p.checkinResult?.timing?.locMs ?? 0}ms</strong></span>
+              </div>
+            </div>
+            <button className="btn btn-secondary btn-sm" onClick={p.resetCheckin}>
+              Check In Another Lecture
+            </button>
+          </div>
+        )}
+
+        {p.checkinStage === 'error' && (
+          <div className="checkin-outcome-box outcome-danger">
+            <div className="outcome-icon-circle mark-danger">✕</div>
+            <div className="outcome-text">
+              <h3>Check-In Failed</h3>
+              <p>{p.checkinResult?.message || 'Unable to verify classroom attendance.'}</p>
+            </div>
+            <button className="btn btn-secondary btn-sm" onClick={p.resetCheckin}>
+              Try Again
+            </button>
+          </div>
+        )}
+
+        {/* 3. Active Scanning Zone (shown when not yet finalized) */}
+        {p.checkinStage !== 'marked' && p.checkinStage !== 'needs_review' && (
+          <>
+            <div className="scanner-action-zone">
+              {p.scanning ? (
+                <div className="camera-viewfinder-box">
+                  <video className="scanner-video" ref={p.videoRef} />
+                  <div className="scanner-overlay-grid">
+                    <div className="laser-scanner-line"></div>
+                  </div>
+                  <div className="scanner-instruction-tag">Scan the class QR</div>
+                  <button className="btn btn-secondary btn-sm scanner-cancel" onClick={p.stopScanner}>
+                    ✕ Close Camera
+                  </button>
+                </div>
+              ) : (
+                <div className="open-camera-hero" onClick={p.startScanner}>
+                  <div className="cam-icon-circle"><Icon name="camera" size={32} /></div>
+                  <h3>Tap to Launch Camera Scanner</h3>
+                  <p>Scan the class QR projected on the screen</p>
+                </div>
+              )}
+            </div>
+
+            <div className="qr-input-submit-row">
+              <div className="input-group flex-1">
+                <label>Scanned QR Token</label>
+                <input
+                  value={p.qrToken}
+                  onChange={(e) => p.setQrToken(e.target.value)}
+                  placeholder="QR token automatically populates here upon scan..."
+                />
+              </div>
+
+              <button
+                className="btn btn-primary btn-lg"
+                onClick={p.checkIn}
+                disabled={!p.qrToken || p.checkinStage === 'submitting'}
+              >
+                <Icon name="location" size={18} />{' '}
+                {p.checkinStage === 'submitting'
+                  ? 'Verifying…'
+                  : p.locationStatus === 'error'
+                  ? 'Submit for Teacher Review'
+                  : 'Verify Location & Check In'}
+              </button>
+            </div>
+          </>
+        )}
       </section>
 
       {/* STUDENT COURSES & NOTIFICATIONS */}

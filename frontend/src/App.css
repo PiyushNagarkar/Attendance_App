@@ -1041,6 +1041,25 @@ input:focus, select:focus {
 .status-present, .status-ok { background: var(--success-light); color: var(--success-dark); }
 .status-late { background: var(--warning-light); color: var(--warning-dark); }
 .status-absent, .status-defaulter { background: var(--danger-light); color: var(--danger-dark); }
+.status-needs_review, .status-review { background: #fef3c7; color: #b45309; border: 1px solid #fcd34d; }
+
+.roster-review-alert-badge {
+  background: #fef3c7;
+  color: #b45309;
+  border: 1px solid #fcd34d;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 700;
+  margin-left: 8px;
+}
+
+.roster-review-reason-text {
+  font-size: 11px;
+  color: #d97706;
+  margin-top: 3px;
+  font-weight: 600;
+}
 
 .dist-text {
   font-size: 12px;
@@ -1248,6 +1267,139 @@ input:focus, select:focus {
   display: flex;
   gap: 12px;
   align-items: flex-end;
+}
+
+/* Concise Status Row & Pills */
+.checkin-status-row {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.concise-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-radius: var(--radius-full);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.concise-status-pill.status-finding {
+  background: #eff6ff;
+  color: #1d4ed8;
+  border: 1px solid #bfdbfe;
+}
+
+.concise-status-pill.status-ready {
+  background: #ecfdf5;
+  color: #047857;
+  border: 1px solid #a7f3d0;
+}
+
+.concise-status-pill.status-warning {
+  background: #fffbeb;
+  color: #b45309;
+  border: 1px solid #fde68a;
+}
+
+.pill-sub {
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.06);
+  padding: 2px 6px;
+  border-radius: 8px;
+}
+
+.scanner-instruction-tag {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  padding: 4px 14px;
+  border-radius: var(--radius-full);
+  font-size: 12px;
+  font-weight: 700;
+  z-index: 10;
+  letter-spacing: 0.3px;
+}
+
+/* Check-In Outcome Boxes */
+.checkin-outcome-box {
+  padding: 24px 20px;
+  border-radius: var(--radius-lg);
+  margin: 16px 0 20px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.checkin-outcome-box.outcome-marked {
+  background: #f0fdf4;
+  border: 2px solid #86efac;
+  color: #166534;
+}
+
+.checkin-outcome-box.outcome-review {
+  background: #fffbeb;
+  border: 2px solid #fde68a;
+  color: #92400e;
+}
+
+.checkin-outcome-box.outcome-danger {
+  background: #fef2f2;
+  border: 2px solid #fecaca;
+  color: #991b1b;
+}
+
+.outcome-icon-circle {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+}
+
+.outcome-icon-circle.mark-success { background: #22c55e; color: #fff; }
+.outcome-icon-circle.mark-review { background: #f59e0b; color: #fff; }
+.outcome-icon-circle.mark-danger { background: #ef4444; color: #fff; font-size: 22px; font-weight: 800; }
+
+.outcome-text h3 {
+  font-size: 20px;
+  font-weight: 800;
+  margin-bottom: 4px;
+}
+
+.review-reason-lead {
+  font-weight: 700;
+  font-size: 14px;
+  color: #b45309;
+}
+
+.review-explanation {
+  font-size: 13px;
+  max-width: 520px;
+  margin: 6px auto;
+  color: #78350f;
+  line-height: 1.5;
+}
+
+.outcome-diagnostics {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.75);
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  margin-top: 6px;
+  color: #334155;
 }
 
 .student-dashboard-split {

@@ -116,6 +116,11 @@ class Attendance(Base):
     distance_m: Mapped[float] = mapped_column(Float)
     gps_accuracy_m: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(20), default="present")
+    sample_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=1)
+    sample_spread_m: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=0.0)
+    location_time_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    scan_time_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    review_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
 class Notification(Base):
     __tablename__ = "notifications"
@@ -161,6 +166,11 @@ try:
             ("users", "device_bound_at DATETIME"),
             ("classrooms", "corners_json TEXT"),
             ("classrooms", "buffer_m FLOAT DEFAULT 5.0"),
+            ("attendance", "sample_count INTEGER DEFAULT 1"),
+            ("attendance", "sample_spread_m FLOAT DEFAULT 0.0"),
+            ("attendance", "location_time_ms INTEGER"),
+            ("attendance", "scan_time_ms INTEGER"),
+            ("attendance", "review_reason VARCHAR(255)"),
         ]:
             try:
                 conn.execute(text(f"ALTER TABLE {col_def[0]} ADD COLUMN {col_def[1]}"))
@@ -284,10 +294,16 @@ class TimetableSlotIn(BaseModel):
 
 class CheckIn(BaseModel):
     token: str
-    latitude: float
-    longitude: float
-    gps_accuracy_m: float = Field(ge=0)
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    gps_accuracy_m: Optional[float] = Field(default=None, ge=0)
     device_id: Optional[str] = None
+    location_time_ms: Optional[int] = None
+    scan_time_ms: Optional[int] = None
+    sample_count: Optional[int] = Field(default=1, ge=0)
+    sample_spread_m: Optional[float] = Field(default=0.0, ge=0)
+    review_requested: Optional[bool] = False
+    review_reason: Optional[str] = None
 
 def db():
     s = SessionLocal()
@@ -345,9 +361,28 @@ def is_inside_polygon(px, py, poly_xy):
         p1x, p1y = p2x, p2y
     return inside
 
-def verify_4corner_geofence(student_lat, student_lon, corners, buffer_m=5.0, gps_accuracy_m=0.0):
+# =========================================================================
+# GPS EVALUATION THRESHOLDS
+# Preserving existing configured values where possible.
+# Note: Values marked [TESTING-RECOMMENDED] should be calibrated with physical
+# devices in the actual classroom environment (accounting for wall construction & roof).
+# =========================================================================
+DEFAULT_BUFFER_M = 5.0            # Preserved from classroom default buffer_m
+MAX_CLEAR_ACCURACY_M = 25.0       # [TESTING-RECOMMENDED] Max GPS error radius (m) for automatic 'present'
+MAX_STABLE_SPREAD_M = 12.0        # [TESTING-RECOMMENDED] Max variance across multiple readings for stable fix
+MAX_REVIEW_BOUNDARY_MARGIN = 20.0 # [TESTING-RECOMMENDED] Proximity outside buffer where student is flagged for review instead of rejected
+HARD_PROXY_REJECT_DISTANCE = 60.0 # [TESTING-RECOMMENDED] Distance outside boundary beyond which check-in is an off-site proxy attempt
+MAX_PERMISSIBLE_ACCURACY_M = 65.0 # Preserved from existing check: accuracy worse than this is uncertain
+
+def calculate_geofence_distance(student_lat: float, student_lon: float, corners: list):
+    """
+    Calculates exact distance in meters from student position to configured classroom polygon.
+    Returns:
+      dist_to_boundary: 0.0 if strictly inside polygon, else distance to the nearest perimeter edge in meters.
+      is_inside: bool indicating if position is strictly inside the 4-corner polygon.
+    """
     if not corners or len(corners) < 4:
-        return False, 999.0
+        return 999.0, False
 
     ref_lat = sum(c["lat"] for c in corners[:4]) / 4.0
     ref_lon = sum(c["lng"] for c in corners[:4]) / 4.0
@@ -363,11 +398,9 @@ def verify_4corner_geofence(student_lat, student_lon, corners, buffer_m=5.0, gps
     stu_x = R * math.radians(student_lon - ref_lon) * cos_ref
     stu_y = R * math.radians(student_lat - ref_lat)
 
-    # 1. Check if strictly inside 4-corner boundary
     if is_inside_polygon(stu_x, stu_y, poly_xy):
-        return True, 0.0
+        return 0.0, True
 
-    # 2. Check distance to 4 perimeter edges
     min_dist = float("inf")
     for i in range(4):
         ax, ay = poly_xy[i]
@@ -376,14 +409,17 @@ def verify_4corner_geofence(student_lat, student_lon, corners, buffer_m=5.0, gps
         if d < min_dist:
             min_dist = d
 
-    # Indoor GPS multipath uncertainty compensation (up to 8m allowance)
-    # The actual physical position is within a circle of radius gps_accuracy_m
+    return min_dist, False
+
+def verify_4corner_geofence(student_lat, student_lon, corners, buffer_m=5.0, gps_accuracy_m=0.0):
+    min_dist, is_inside = calculate_geofence_distance(student_lat, student_lon, corners)
+    if is_inside:
+        return True, 0.0
+
     gps_allowance = min(max(0.0, gps_accuracy_m) * 0.45, 8.0) if gps_accuracy_m > 0 else 0.0
     effective_tolerance = buffer_m + gps_allowance
-
     if min_dist <= effective_tolerance:
         return True, min_dist
-
     return False, min_dist
 
 
@@ -410,7 +446,11 @@ def report_rows(s: Session, course: Course):
     total = len(ids)
     rows = []
     for student in students:
-        present = s.query(Attendance).filter(Attendance.student_id == student.id, Attendance.session_id.in_(ids)).count() if ids else 0
+        present = s.query(Attendance).filter(
+            Attendance.student_id == student.id,
+            Attendance.session_id.in_(ids),
+            Attendance.status.in_(["present", "late"])
+        ).count() if ids else 0
         rows.append({
             "student_id": student.id,
             "name": student.name,
@@ -902,7 +942,13 @@ def roster(session_id: int, s: Session = Depends(db), teacher: User = Depends(re
             "department": st_user.department if st_user else "",
             "status": x.status,
             "marked_at": x.marked_at,
-            "distance_m": round(x.distance_m, 1),
+            "distance_m": round(x.distance_m, 1) if x.distance_m is not None else 0.0,
+            "gps_accuracy_m": round(x.gps_accuracy_m, 1) if x.gps_accuracy_m is not None else None,
+            "sample_count": x.sample_count,
+            "sample_spread_m": round(x.sample_spread_m, 1) if x.sample_spread_m is not None else None,
+            "location_time_ms": x.location_time_ms,
+            "scan_time_ms": x.scan_time_ms,
+            "review_reason": x.review_reason,
         })
     return res
 
@@ -926,7 +972,9 @@ def enrolled_status(session_id: int, s: Session = Depends(db), teacher: User = D
             "marked": bool(att),
             "status": att.status if att else "absent",
             "marked_at": att.marked_at if att else None,
-            "distance_m": round(att.distance_m, 1) if att else None,
+            "distance_m": round(att.distance_m, 1) if att and att.distance_m is not None else None,
+            "gps_accuracy_m": round(att.gps_accuracy_m, 1) if att and att.gps_accuracy_m is not None else None,
+            "review_reason": att.review_reason if att else None,
         })
     return res
 
@@ -943,6 +991,8 @@ def manual_mark(session_id: int, data: ManualMarkIn, s: Session = Depends(db), t
     if att:
         att.status = data.status
         att.marked_at = datetime.utcnow()
+        if data.status == "present":
+            att.review_reason = None
     else:
         att = Attendance(session_id=session_id, student_id=data.student_id, marked_at=datetime.utcnow(), distance_m=0.0, gps_accuracy_m=0.0, status=data.status)
         s.add(att)
@@ -1020,8 +1070,16 @@ def checkin(data: CheckIn, s: Session = Depends(db), student: User = Depends(req
         raise HTTPException(400, "QR session is expired or invalid")
     if not s.query(Enrollment).filter_by(student_id=student.id, course_id=row.course_id).first():
         raise HTTPException(403, "You are not enrolled in this class")
-    if s.query(Attendance).filter_by(session_id=row.id, student_id=student.id).first():
-        raise HTTPException(409, "Attendance already marked for this session")
+    
+    # Prevent duplicate check-ins
+    existing_att = s.query(Attendance).filter_by(session_id=row.id, student_id=student.id).first()
+    if existing_att:
+        if existing_att.status == "present":
+            raise HTTPException(409, "Attendance already marked for this session")
+        elif existing_att.status == "needs_review":
+            raise HTTPException(409, "Attendance check-in already submitted and awaiting teacher review")
+        else:
+            raise HTTPException(409, "Attendance already recorded for this session")
 
     # Anti-Proxy Device Hardware Binding Verification
     if data.device_id:
@@ -1042,44 +1100,104 @@ def checkin(data: CheckIn, s: Session = Depends(db), student: User = Depends(req
     if not room:
         raise HTTPException(500, "Classroom configuration missing")
 
-    # 4-Corner Rectangular Geofence with 5m Buffer
-    buffer_allowed = room.buffer_m if room.buffer_m is not None else 5.0
-    dist_to_boundary = 0.0
+    buffer_allowed = room.buffer_m if room.buffer_m is not None else DEFAULT_BUFFER_M
+    has_coords = data.latitude is not None and data.longitude is not None
+    acc = float(data.gps_accuracy_m) if data.gps_accuracy_m is not None else None
+    spread = float(data.sample_spread_m) if data.sample_spread_m is not None else 0.0
 
-    if room.corners_json:
-        try:
-            corners = json.loads(room.corners_json)
-        except Exception:
-            corners = []
-
-        if len(corners) >= 4:
-            is_valid, dist_to_boundary = verify_4corner_geofence(
-                data.latitude, data.longitude, corners, buffer_m=buffer_allowed, gps_accuracy_m=data.gps_accuracy_m
-            )
-            if not is_valid:
-                raise HTTPException(
-                    403,
-                    f"Outside classroom boundary ({dist_to_boundary:.1f}m outside nearest wall; allowed buffer is {buffer_allowed:.0f}m, satellite precision ±{data.gps_accuracy_m:.1f}m)"
-                )
+    if not has_coords or data.review_requested:
+        # Location unavailable on client (permission denied or GPS timed out)
+        review_reason = data.review_reason or "Location unavailable (permission denied or GPS timed out)"
+        status = "needs_review"
+        dist_to_boundary = 0.0
+        acc_val = acc or 0.0
+        message = "Needs teacher review: GPS location was unavailable. Recorded for teacher approval on live roster."
+    else:
+        # Calculate physical distance to boundary without silently expanding geofence
+        dist_to_boundary = 0.0
+        if room.corners_json:
+            try:
+                corners = json.loads(room.corners_json)
+            except Exception:
+                corners = []
+            if len(corners) >= 4:
+                dist_to_boundary, is_inside = calculate_geofence_distance(data.latitude, data.longitude, corners)
+            else:
+                metres = distance(data.latitude, data.longitude, room.latitude, room.longitude)
+                dist_to_boundary = max(0.0, metres - buffer_allowed)
         else:
             metres = distance(data.latitude, data.longitude, room.latitude, room.longitude)
-            eff_buf = buffer_allowed + min(max(0.0, data.gps_accuracy_m) * 0.45, 8.0)
-            if metres > eff_buf:
-                raise HTTPException(403, f"Outside classroom boundary ({metres:.1f}m away; allowed buffer is {buffer_allowed:.0f}m)")
-            dist_to_boundary = metres
-    else:
-        metres = distance(data.latitude, data.longitude, room.latitude, room.longitude)
-        eff_buf = buffer_allowed + min(max(0.0, data.gps_accuracy_m) * 0.45, 8.0)
-        if metres > eff_buf:
-            raise HTTPException(403, f"Outside classroom boundary ({metres:.1f}m away; allowed buffer is {buffer_allowed:.0f}m)")
-        dist_to_boundary = metres
+            dist_to_boundary = max(0.0, metres - buffer_allowed)
 
-    if data.gps_accuracy_m > 65.0:
-        raise HTTPException(422, f"GPS satellite accuracy is too low (±{data.gps_accuracy_m:.1f}m). Please move near a window or hold phone steady and retry.")
-    
-    s.add(Attendance(session_id=row.id, student_id=student.id, marked_at=datetime.utcnow(), distance_m=dist_to_boundary, gps_accuracy_m=data.gps_accuracy_m, status="present"))
+        acc_val = acc if acc is not None else 99.0
+
+        # Decision Logic:
+        # 1. Clear off-site proxy rejection
+        max_tolerated_uncertainty = max(HARD_PROXY_REJECT_DISTANCE, buffer_allowed + acc_val)
+        if dist_to_boundary > max_tolerated_uncertainty:
+            raise HTTPException(
+                403,
+                f"Outside classroom boundary ({dist_to_boundary:.1f}m outside nearest wall; allowed buffer is {buffer_allowed:.0f}m)"
+            )
+
+        # 2. Clear match (satisfies existing acceptance rules)
+        if dist_to_boundary <= buffer_allowed and acc_val <= MAX_CLEAR_ACCURACY_M and spread <= MAX_STABLE_SPREAD_M:
+            status = "present"
+            review_reason = None
+            message = f"✓ Attendance marked! Verified inside classroom boundary ({buffer_allowed:.0f}m buffer, ±{acc_val:.1f}m GPS lock)."
+        else:
+            # 3. Uncertain evidence -> Route to Teacher Review (avoid false rejection or blocking)
+            status = "needs_review"
+            reasons = []
+            if dist_to_boundary > buffer_allowed:
+                reasons.append(f"Near boundary ({dist_to_boundary:.1f}m from room, buffer {buffer_allowed:.0f}m)")
+            if acc_val > MAX_CLEAR_ACCURACY_M:
+                reasons.append(f"GPS accuracy ±{acc_val:.1f}m")
+            if spread > MAX_STABLE_SPREAD_M:
+                reasons.append(f"Unstable sample spread ({spread:.1f}m)")
+            review_reason = "; ".join(reasons) if reasons else "Indoor GPS multipath uncertainty"
+            message = f"Needs teacher review: {review_reason}. Your professor can verify on the live roster."
+
+    att = Attendance(
+        session_id=row.id,
+        student_id=student.id,
+        marked_at=datetime.utcnow(),
+        distance_m=dist_to_boundary,
+        gps_accuracy_m=acc_val,
+        status=status,
+        sample_count=data.sample_count or 1,
+        sample_spread_m=spread,
+        location_time_ms=data.location_time_ms,
+        scan_time_ms=data.scan_time_ms,
+        review_reason=review_reason,
+    )
+    s.add(att)
+    if status == "needs_review":
+        log_audit(
+            s,
+            action="ATTENDANCE_FLAGGED_REVIEW",
+            target_type="attendance",
+            target_id=None,
+            details=f"Check-in for student {student.name} flagged for review: {review_reason}",
+            user_id=student.id,
+        )
+    else:
+        log_audit(
+            s,
+            action="ATTENDANCE_MARKED",
+            target_type="attendance",
+            target_id=None,
+            details=f"Student {student.name} checked in (distance {dist_to_boundary:.1f}m, accuracy ±{acc_val:.1f}m)",
+            user_id=student.id,
+        )
     s.commit()
-    return {"status": "present", "distance_m": round(dist_to_boundary, 2), "message": f"✓ Verified inside classroom boundary ({buffer_allowed:.0f}m buffer, ±{data.gps_accuracy_m:.1f}m GPS lock)!"}
+    return {
+        "status": status,
+        "distance_m": round(dist_to_boundary, 2),
+        "gps_accuracy_m": round(acc_val, 1) if acc is not None else None,
+        "message": message,
+        "review_reason": review_reason,
+    }
 
 
 @app.get("/student/dashboard")
